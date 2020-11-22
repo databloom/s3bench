@@ -3,16 +3,21 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"net/http"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -28,14 +33,20 @@ const (
 var bufferBytes []byte
 
 func main() {
+
+	optypes := []string{"read", "write", "both"}
+	operationListString := strings.Join(optypes[:], ", ")
+
 	endpoint := flag.String("endpoint", "", "S3 endpoint(s) comma separated - http://IP:PORT,http://IP:PORT")
-	region := flag.String("region", "igneous-test", "AWS region to use, eg: us-west-1|us-east-1, etc")
+	region := flag.String("region", "vast-west", "AWS region to use, eg: us-west-1|us-east-1, etc")
 	accessKey := flag.String("accessKey", "", "the S3 access key")
 	accessSecret := flag.String("accessSecret", "", "the S3 access secret")
+	operations := flag.String("operations", "write", "ops:"+operationListString)
 	bucketName := flag.String("bucket", "bucketname", "the bucket for which to run the test")
 	objectNamePrefix := flag.String("objectNamePrefix", "loadgen_test_", "prefix of the object name that will be used")
 	objectSize := flag.Int64("objectSize", 80*1024*1024, "size of individual requests in bytes (must be smaller than main memory)")
 	numClients := flag.Int("numClients", 40, "number of concurrent clients")
+	batchSize := flag.Int("batchSize", 1000, "per-prefix batchsize")
 	numSamples := flag.Int("numSamples", 200, "total number of requests to send")
 	skipCleanup := flag.Bool("skipCleanup", false, "skip deleting objects created by this tool at the end of the run")
 	verbose := flag.Bool("verbose", false, "print verbose per thread status")
@@ -53,22 +64,39 @@ func main() {
 		os.Exit(1)
 	}
 
+	var opTypeExists = false
+	for op := range optypes {
+		if optypes[op] == *operations {
+			opTypeExists = true
+		}
+	}
+
+	if !opTypeExists {
+		fmt.Printf("operation type must be one of: %s \n", operationListString)
+		os.Exit(1)
+	}
+
+	//os.Exit(3)
+	// Generate the data from which we will do the writting
+
 	// Setup and print summary of the accepted parameters
 	params := Params{
 		requests:         make(chan Req),
 		responses:        make(chan Resp),
 		numSamples:       *numSamples,
+		batchSize:        *batchSize,
 		numClients:       uint(*numClients),
 		objectSize:       *objectSize,
 		objectNamePrefix: *objectNamePrefix,
 		bucketName:       *bucketName,
 		endpoints:        strings.Split(*endpoint, ","),
-		verbose:          *verbose,
+		operations:       *operations,
+
+		verbose: *verbose,
 	}
 	fmt.Println(params)
 	fmt.Println()
 
-	// Generate the data from which we will do the writting
 	fmt.Printf("Generating in-memory sample data... ")
 	timeGenData := time.Now()
 	bufferBytes = make([]byte, *objectSize, *objectSize)
@@ -81,27 +109,81 @@ func main() {
 	fmt.Println()
 
 	// Start the load clients and run a write test followed by a read test
+
+	var httpClient = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	
+
 	cfg := &aws.Config{
 		Credentials:      credentials.NewStaticCredentials(*accessKey, *accessSecret, ""),
 		Region:           aws.String(*region),
 		S3ForcePathStyle: aws.Bool(true),
+		Endpoint:         aws.String(params.endpoints[0]),
+		HTTPClient:		  httpClient,
 	}
+
+	// make a bucket first
+
+	log.Println("creating bucket if required")
+
+
+	
+
+	sess := session.New(cfg)
+
+	s3client := s3.New(sess)
+	
+	cparams := &s3.CreateBucketInput{
+		Bucket: bucketName, // Required
+	}
+	if _, derr := s3client.CreateBucket(cparams); derr != nil && !isBucketAlreadyOwnedByYouErr(derr) {
+		log.Fatal(derr)
+	}
+
 	params.StartClients(cfg)
 
-	fmt.Printf("Running %s test...\n", opWrite)
-	writeResult := params.Run(opWrite)
-	fmt.Println()
+	/*
 
-	fmt.Printf("Running %s test...\n", opRead)
-	readResult := params.Run(opRead)
-	fmt.Println()
+		here's what we'll try to do.
+		1.  allow choice of write, read (maybe later list, etc)
+		2.  if write only, just skip doing reads
+		3.  if both, then just do writes and then reads
+		4.  if reads: then we have to first check if there is existing data in the bucket/prefix we can use.
 
-	// Repeating the parameters of the test followed by the results
-	fmt.Println(params)
-	fmt.Println()
-	fmt.Println(writeResult)
-	fmt.Println()
-	fmt.Println(readResult)
+	*/
+
+	if strings.Contains(params.operations, "write") {
+
+		fmt.Printf("Running %s test...\n", opWrite)
+		writeResult := params.Run(opWrite)
+		fmt.Println(params)
+		fmt.Println(writeResult)
+		fmt.Println()
+
+	} else if strings.Contains(params.operations, "read") {
+
+		fmt.Printf("Running %s test...\n", opRead)
+		readResult := params.Run(opRead)
+		fmt.Println(params)
+		fmt.Println(readResult)
+
+		fmt.Println()
+
+	} else if strings.Contains(params.operations, "both") {
+		fmt.Printf("Running %s test...\n", opWrite)
+		writeResult := params.Run(opWrite)
+
+		fmt.Printf("Running %s test...\n", opRead)
+		readResult := params.Run(opRead)
+		fmt.Println(writeResult)
+		fmt.Println()
+		fmt.Println(readResult)
+		fmt.Println()
+
+	}
 
 	// Do cleanup if required
 	if !*skipCleanup {
@@ -140,6 +222,13 @@ func main() {
 	}
 }
 
+func isBucketAlreadyOwnedByYouErr(err error) bool {
+	if aErr, ok := err.(awserr.Error); ok {
+		return aErr.Code() == s3.ErrCodeBucketAlreadyOwnedByYou
+	}
+	return false
+}
+
 func (params *Params) Run(op string) Result {
 	startTime := time.Now()
 
@@ -174,23 +263,56 @@ func (params *Params) Run(op string) Result {
 // Create an individual load request and submit it to the client queue
 func (params *Params) submitLoad(op string) {
 	bucket := aws.String(params.bucketName)
+
+	/*
+		goal here is to divide up all the requests so that there are no more than 1,000 per prefix-$num/ .
+		EG: if the prefix is 'andy' , then we want to make $(numsamples / 1000) sub-prefixes , so that the result is:
+		bucket/andy/1/
+		bucket/andy/2/
+		etc
+		That way we can fan out the objects more.
+	*/
+	keyList := make([]*string, 0, params.batchSize)
+	bigList := make([]*string, 0, params.numSamples)
+	numDirs := 0
 	for i := 0; i < params.numSamples; i++ {
-		key := aws.String(fmt.Sprintf("%s%d", params.objectNamePrefix, i))
+		bar := string(i)
+		keyList = append(keyList, &bar)
+		if len(keyList) == params.batchSize || i == params.numSamples-1 {
+
+			for j := 0; j < len(keyList); j++ {
+				pref := params.objectNamePrefix + "/" + strconv.Itoa(numDirs) + "/"
+				key := aws.String(fmt.Sprintf("%s%d", pref, j))
+				bigList = append(bigList, key)
+
+			}
+
+			//increment the dirname
+			numDirs++
+			//set cursor to 0 so we can move to the next batch.
+			keyList = keyList[:0]
+
+		}
+	}
+
+	// now actually submit the load.
+	for f := 0; f < len(bigList); f++ {
 		if op == opWrite {
 			params.requests <- &s3.PutObjectInput{
 				Bucket: bucket,
-				Key:    key,
+				Key:    bigList[f],
 				Body:   bytes.NewReader(bufferBytes),
 			}
 		} else if op == opRead {
 			params.requests <- &s3.GetObjectInput{
 				Bucket: bucket,
-				Key:    key,
+				Key:    bigList[f],
 			}
 		} else {
 			panic("Developer error")
 		}
 	}
+
 }
 
 func (params *Params) StartClients(cfg *aws.Config) {
@@ -236,9 +358,11 @@ func (params *Params) startClient(cfg *aws.Config) {
 // Specifies the parameters for a given test
 type Params struct {
 	operation        string
+	operations       string
 	requests         chan Req
 	responses        chan Resp
 	numSamples       int
+	batchSize        int
 	numClients       uint
 	objectSize       int64
 	objectNamePrefix string
@@ -255,6 +379,7 @@ func (params Params) String() string {
 	output += fmt.Sprintf("objectSize:       %0.4f MB\n", float64(params.objectSize)/(1024*1024))
 	output += fmt.Sprintf("numClients:       %d\n", params.numClients)
 	output += fmt.Sprintf("numSamples:       %d\n", params.numSamples)
+	output += fmt.Sprintf("batchSize:       %d\n", params.batchSize)
 	output += fmt.Sprintf("verbose:       %d\n", params.verbose)
 	return output
 }
