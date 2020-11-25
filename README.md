@@ -19,6 +19,17 @@ The binary will be placed under $GOPATH/bin/s3bench.
 The s3bench command is self-describing. In order to see all the available options
 just run s3bench -help.
 
+### Note on multipart
+Currently it is using the `s3manager` package to abstract some of the MPU logic (make easier).  However, there are some side effects:
+* the object size cannot exceed a resonable % of RAM on the host. The logic is such that it creates the entire object in RAM, and then the MPU splits it into pieces.
+* It appears to send the 'last part first', which can lead to interesting effects on some objectstores.
+* specifying `-numClients` starts up XX sessions, which translates to maximum concurrent object-uploads: however each object-upload will leverage `-multiUploaders` , so the effect is multiplicative.  Use with care.
+* you can specify `-partSize`
+
+In the future, leveraging the standard (manual) multipart upload logic will allow us to:
+* only create the `partSize` in RAM
+* effectively making each part identical
+* upload each part manually (which lets us control the order as well)
 ### Example input
 The following will run a benchmark from 2 concurrent clients, which in
 aggregate will put a total of 10 unique new objects. Each object will be

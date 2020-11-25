@@ -1,3 +1,18 @@
+/*
+Multipart: first, just do something basic, where we use the s3manager to handle the MPU requests for us.  The pro: less code.  The con:
+for objects which are extremely large in size (eg: >100GB), we don't have enough RAM to be able to put the object in memory before splitting it.
+
+s3manager example: https://stackoverflow.com/questions/34177137/stream-file-upload-to-aws-s3-using-go
+
+
+In order to do the 'proper' multipart test, perhaps use an example from here: https://github.com/apoorvam/aws-s3-multipart-upload/blob/master/aws-multipart-upload.go , where we:
+
+1.  use the bufferBytes for the 'part' content, not the object
+2.  dispatch the part-requests to the client queue for completion
+3.  once all responses for a given object come back, perform the completion call
+4.  measure the time for the total upload in order to calculate the b/w (it may not be valid to calc the runtime for each part)
+
+*/
 package main
 
 import (
@@ -9,18 +24,20 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-	"net/http"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	//"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
 const (
@@ -42,6 +59,9 @@ func main() {
 	accessKey := flag.String("accessKey", "", "the S3 access key")
 	accessSecret := flag.String("accessSecret", "", "the S3 access secret")
 	operations := flag.String("operations", "write", "ops:"+operationListString)
+	multipart := flag.Bool("multipart", false, "perform multipart uploads")
+	partSize := flag.Int64("partSize", 500*1024*1024, "size for MPU parts")
+	multiUploaders := flag.Int("multiUploaders", 5, "number of MPU uploaders per client..this is multiplicative with numClients..")
 	bucketName := flag.String("bucket", "bucketname", "the bucket for which to run the test")
 	objectNamePrefix := flag.String("objectNamePrefix", "loadgen_test_", "prefix of the object name that will be used")
 	objectSize := flag.Int64("objectSize", 80*1024*1024, "size of individual requests in bytes (must be smaller than main memory)")
@@ -50,6 +70,7 @@ func main() {
 	numSamples := flag.Int("numSamples", 200, "total number of requests to send")
 	skipCleanup := flag.Bool("skipCleanup", false, "skip deleting objects created by this tool at the end of the run")
 	verbose := flag.Bool("verbose", false, "print verbose per thread status")
+	disableMD5 := flag.Bool("disableMD5", true, "for v4 auth: disable source md5sum calcs (faster)")
 
 	flag.Parse()
 
@@ -91,6 +112,10 @@ func main() {
 		bucketName:       *bucketName,
 		endpoints:        strings.Split(*endpoint, ","),
 		operations:       *operations,
+		multipart:        *multipart,
+		partSize:         *partSize,
+		multiUploaders:   *multiUploaders,
+		disableMD5:       *disableMD5,
 
 		verbose: *verbose,
 	}
@@ -99,12 +124,14 @@ func main() {
 
 	fmt.Printf("Generating in-memory sample data... ")
 	timeGenData := time.Now()
+
 	bufferBytes = make([]byte, *objectSize, *objectSize)
 	_, err := rand.Read(bufferBytes)
 	if err != nil {
 		fmt.Printf("Could not allocate a buffer")
 		os.Exit(1)
 	}
+
 	fmt.Printf("Done (%s)\n", time.Since(timeGenData))
 	fmt.Println()
 
@@ -115,27 +142,24 @@ func main() {
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
 	}
-	
 
 	cfg := &aws.Config{
-		Credentials:      credentials.NewStaticCredentials(*accessKey, *accessSecret, ""),
-		Region:           aws.String(*region),
-		S3ForcePathStyle: aws.Bool(true),
-		Endpoint:         aws.String(params.endpoints[0]),
-		HTTPClient:		  httpClient,
+		Credentials:                   credentials.NewStaticCredentials(*accessKey, *accessSecret, ""),
+		Region:                        aws.String(*region),
+		S3ForcePathStyle:              aws.Bool(true),
+		S3DisableContentMD5Validation: aws.Bool(params.disableMD5),
+		Endpoint:                      aws.String(params.endpoints[0]),
+		HTTPClient:                    httpClient,
 	}
 
 	// make a bucket first
 
 	log.Println("creating bucket if required")
 
-
-	
-
 	sess := session.New(cfg)
 
 	s3client := s3.New(sess)
-	
+
 	cparams := &s3.CreateBucketInput{
 		Bucket: bucketName, // Required
 	}
@@ -265,8 +289,8 @@ func (params *Params) submitLoad(op string) {
 	bucket := aws.String(params.bucketName)
 
 	/*
-		goal here is to divide up all the requests so that there are no more than 1,000 per prefix-$num/ .
-		EG: if the prefix is 'andy' , then we want to make $(numsamples / 1000) sub-prefixes , so that the result is:
+		goal here is to divide up all the requests so that there are no more than $batchSize per prefix-$num/ .
+		EG: if the prefix is 'andy' , then we want to make $(numsamples / $batchSize) sub-prefixes , so that the result is:
 		bucket/andy/1/
 		bucket/andy/2/
 		etc
@@ -296,12 +320,23 @@ func (params *Params) submitLoad(op string) {
 	}
 
 	// now actually submit the load.
+
 	for f := 0; f < len(bigList); f++ {
 		if op == opWrite {
-			params.requests <- &s3.PutObjectInput{
-				Bucket: bucket,
-				Key:    bigList[f],
-				Body:   bytes.NewReader(bufferBytes),
+
+			if params.multipart {
+				params.requests <- &s3manager.UploadInput{
+					Bucket: bucket,
+					Key:    bigList[f],
+					Body:   bytes.NewReader(bufferBytes),
+				}
+
+			} else {
+				params.requests <- &s3.PutObjectInput{
+					Bucket: bucket,
+					Key:    bigList[f],
+					Body:   bytes.NewReader(bufferBytes),
+				}
 			}
 		} else if op == opRead {
 			params.requests <- &s3.GetObjectInput{
@@ -325,33 +360,91 @@ func (params *Params) StartClients(cfg *aws.Config) {
 
 // Run an individual load request
 func (params *Params) startClient(cfg *aws.Config) {
-	svc := s3.New(session.New(), cfg)
-	for request := range params.requests {
-		putStartTime := time.Now()
-		var err error
-		numBytes := params.objectSize
 
-		switch r := request.(type) {
-		case *s3.PutObjectInput:
-			req, _ := svc.PutObjectRequest(r)
-			// Disable payload checksum calculation (very expensive)
-			req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-			err = req.Send()
-		case *s3.GetObjectInput:
-			req, resp := svc.GetObjectRequest(r)
-			err = req.Send()
-			numBytes = 0
-			if err == nil {
-				numBytes, err = io.Copy(ioutil.Discard, resp.Body)
-			}
-			if numBytes != params.objectSize {
-				err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
-			}
-		default:
-			panic("Developer error")
+	if params.multipart {
+		sess, err := session.NewSession(cfg)
+		if err != nil {
+			panic("bad session setup?")
 		}
+		for request := range params.requests {
 
-		params.responses <- Resp{err, time.Since(putStartTime), numBytes}
+			putStartTime := time.Now()
+			var err error
+			numBytes := params.objectSize
+
+			switch r := request.(type) {
+			case *s3manager.UploadInput:
+				//https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/go/example_code/s3/s3_upload_object.go
+				uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
+					u.PartSize = params.partSize
+					u.Concurrency = params.multiUploaders
+				})
+
+				_, err := uploader.Upload(r)
+
+				if err != nil {
+					fmt.Printf("error uploading: %v", err)
+				}
+
+			case *s3.GetObjectInput:
+				//https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/go/example_code/s3/s3_download_object.go
+				downloader := s3manager.NewDownloader(sess, func(u *s3manager.Downloader) {
+					u.PartSize = params.partSize
+					u.Concurrency = params.multiUploaders
+				})
+				numBytes = 0
+				file, openErr := os.OpenFile("/dev/null", os.O_WRONLY, 644) //perhaps there's a better way, but this seems to work.
+				if openErr != nil {
+					panic("woops")
+				}
+
+				numBytes, err := downloader.Download(file,
+					r)
+				if err != nil {
+					fmt.Printf("error: %v", err)
+				}
+
+				if numBytes != params.objectSize {
+					err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
+				}
+			default:
+				panic("Developer error")
+			}
+
+			params.responses <- Resp{err, time.Since(putStartTime), numBytes}
+		}
+	} else {
+
+		svc := s3.New(session.New(), cfg)
+		for request := range params.requests {
+			putStartTime := time.Now()
+			var err error
+			numBytes := params.objectSize
+
+			switch r := request.(type) {
+			case *s3.PutObjectInput:
+
+				req, _ := svc.PutObjectRequest(r)
+				// below line shouldn't be required to do the flag in the session setup, but keeping it in case.
+				req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+				err = req.Send()
+
+			case *s3.GetObjectInput:
+				req, resp := svc.GetObjectRequest(r)
+				err = req.Send()
+				numBytes = 0
+				if err == nil {
+					numBytes, err = io.Copy(ioutil.Discard, resp.Body)
+				}
+				if numBytes != params.objectSize {
+					err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
+				}
+			default:
+				panic("Developer error")
+			}
+
+			params.responses <- Resp{err, time.Since(putStartTime), numBytes}
+		}
 	}
 }
 
@@ -365,10 +458,14 @@ type Params struct {
 	batchSize        int
 	numClients       uint
 	objectSize       int64
+	partSize         int64
+	multiUploaders   int
+	multipart        bool
 	objectNamePrefix string
 	bucketName       string
 	endpoints        []string
 	verbose          bool
+	disableMD5       bool
 }
 
 func (params Params) String() string {
