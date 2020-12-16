@@ -11,27 +11,35 @@ uses the AWS Go SDK.
 Run the following command to build the binary.
 
 ```
-go get github.com/igneous-systems/s3bench
+go get github.com/andypern/s3bench
 ```
 The binary will be placed under $GOPATH/bin/s3bench.
+
+manual compile:
+
+```
+go build -ldflags "-linkmode external -extldflags -static"
+```
+
+If you lack a proper go environment to build on, use docker.  Toss this in a `Dockerfile` and you should have what you need: 
+
+```FROM golang:1.13.5-alpine3.10```
+
 
 ## Usage
 The s3bench command is self-describing. In order to see all the available options
 just run s3bench -help.
 
 ### Note on multipart
-Currently it is using the `s3manager` package to abstract some of the MPU logic (make easier).  However, there are some side effects:
-* the object size cannot exceed a resonable % of RAM on the host. The logic is such that it creates the entire object in RAM, and then the MPU splits it into pieces.
-* It appears to send the 'last part first', which can lead to interesting effects on some objectstores.
-* specifying `-numClients` starts up XX sessions, which translates to maximum concurrent object-uploads: however each object-upload will leverage `-multiUploaders` , so the effect is multiplicative.  Use with care.
-* you can specify `-partSize`
+Specifying `-multipart` will only impact writes, not reads (so far).  The current multipart implementation does NOT use the `s3manager` package, rather it is creating parts individually and sending them in parallel per object. Also:
+* The program will generate `-partsize` bytes of random data to use. Each part will be 100% identical (except for the last part, which is smaller).  This will be changed to be more random later.
+* specifying `-numClients` starts up XX sessions, which translates to maximum concurrent object-uploads: however each object-upload will leverage `-multiUploaders` , so the effect is multiplicative.  Use with care.  Put another way:
+   * `-numclients 10` && `-multiUploaders 10` means there will be 100 concurrent threads uploading.
+* you can specify `-partSize` in bytes.  Note that the minimum supported by the SDK is 5MiB.
 
-In the future, leveraging the standard (manual) multipart upload logic will allow us to:
-* only create the `partSize` in RAM
-* effectively making each part identical
-* upload each part manually (which lets us control the order as well)
+
 ### Example input
-The following will run a benchmark from 2 concurrent clients, which in
+The following will run a benchmark from 2 concurrent sessions, which in
 aggregate will put a total of 10 unique new objects. Each object will be
 exactly 1024 bytes. The objects will be placed in a bucket named loadgen.
 The S3 endpoint will be ran against http://endpoint1:80 and
@@ -42,8 +50,8 @@ http://endpoint2:80. Object name will be prefixed with loadgen.
 ```
 
 #### Note on regions & endpoints
-By default, the region used will be `igneous-test` , a fictitious region which
-is suitable for using with the Igneous Data Service.  However, you can elect to
+By default, the region used will be `vast-west` , a fictitious region which
+is suitable for using with the VAST systems.  However, you can elect to
 use this tool with Amazon S3, in which case you will need to specify the proper region.
 
 It is also important when using Amazon S3 that you specify the proper endpoint, which

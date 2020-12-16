@@ -1,16 +1,12 @@
 /*
-Multipart: first, just do something basic, where we use the s3manager to handle the MPU requests for us.  The pro: less code.  The con:
-for objects which are extremely large in size (eg: >100GB), we don't have enough RAM to be able to put the object in memory before splitting it.
 
-s3manager example: https://stackoverflow.com/questions/34177137/stream-file-upload-to-aws-s3-using-go
+*TODO:
+0.  add logic to check if objectSize < MPU size (fallback to regular puts.)
+1.  Make a 'runtime' test: where it will re-run over and over for the specified runtime
+2.  have a 'simplified' output mode to dump only the relevant bits: so when running on many hosts it can be easier to aggregate.
+3.  randomize better: have each 'put' use slightly different data:
+	* maybe: create a buffer that is 2x as big as we need, then just read random offsets from it?
 
-
-In order to do the 'proper' multipart test, perhaps use an example from here: https://github.com/apoorvam/aws-s3-multipart-upload/blob/master/aws-multipart-upload.go , where we:
-
-1.  use the bufferBytes for the 'part' content, not the object
-2.  dispatch the part-requests to the client queue for completion
-3.  once all responses for a given object come back, perform the completion call
-4.  measure the time for the total upload in order to calculate the b/w (it may not be valid to calc the runtime for each part)
 
 */
 package main
@@ -24,11 +20,13 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	mrand "math/rand"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -36,20 +34,18 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	//"github.com/aws/aws-sdk-go/service/s3/s3manager"
 )
 
 const (
 	opRead  = "Read"
 	opWrite = "Write"
-	//max that can be deleted at a time via DeleteObjects()
-	commitSize = 1000
 )
 
 var bufferBytes []byte
 
 func main() {
+
+	// really need to split this thing up into more functions one day.
 
 	optypes := []string{"read", "write", "both"}
 	operationListString := strings.Join(optypes[:], ", ")
@@ -85,6 +81,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	if *multipart && *partSize < 5242880 {
+		fmt.Printf("multipart size must be at least 5242880 bytes, you specificied %v", *partSize)
+		flag.PrintDefaults()
+		os.Exit(1)
+
+	}
 	var opTypeExists = false
 	for op := range optypes {
 		if optypes[op] == *operations {
@@ -97,9 +99,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	//os.Exit(3)
-	// Generate the data from which we will do the writting
-
 	// Setup and print summary of the accepted parameters
 	params := Params{
 		requests:         make(chan Req),
@@ -111,6 +110,9 @@ func main() {
 		objectNamePrefix: *objectNamePrefix,
 		bucketName:       *bucketName,
 		endpoints:        strings.Split(*endpoint, ","),
+		accessKey:        *accessKey,
+		accessSecret:     *accessSecret,
+		region:           *region,
 		operations:       *operations,
 		multipart:        *multipart,
 		partSize:         *partSize,
@@ -122,56 +124,30 @@ func main() {
 	fmt.Println(params)
 	fmt.Println()
 
-	fmt.Printf("Generating in-memory sample data... ")
-	timeGenData := time.Now()
-
-	bufferBytes = make([]byte, *objectSize, *objectSize)
-	_, err := rand.Read(bufferBytes)
-	if err != nil {
-		fmt.Printf("Could not allocate a buffer")
-		os.Exit(1)
-	}
-
-	fmt.Printf("Done (%s)\n", time.Since(timeGenData))
-	fmt.Println()
-
-	// Start the load clients and run a write test followed by a read test
-
-	var httpClient = &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	cfg := &aws.Config{
-		Credentials:                   credentials.NewStaticCredentials(*accessKey, *accessSecret, ""),
-		Region:                        aws.String(*region),
-		S3ForcePathStyle:              aws.Bool(true),
-		S3DisableContentMD5Validation: aws.Bool(params.disableMD5),
-		Endpoint:                      aws.String(params.endpoints[0]),
-		HTTPClient:                    httpClient,
-	}
-
-	// make a bucket first
-
 	log.Println("creating bucket if required")
 
-	sess := session.New(cfg)
+	svc := makeS3session(params, params.endpoints[0])
 
-	s3client := s3.New(sess)
-
-	cparams := &s3.CreateBucketInput{
-		Bucket: bucketName, // Required
-	}
-	if _, derr := s3client.CreateBucket(cparams); derr != nil && !isBucketAlreadyOwnedByYouErr(derr) {
-		log.Fatal(derr)
-	}
-
-	params.StartClients(cfg)
+	makeBucket(bucketName, svc)
 
 	/*
+		function flow:
+		1.  startClients -> loops through the -numClients and generates s3 sessions, then launches a go routine (startclient)
+		1.5 : those go routines 'sit at the ready'
+		2.  startclient : these are the 'at the ready' clients, ready to do work
+		3.  params.Run : this launches a goroutine to run params.submitLoad
+		4. params.submitload : calls params.makeKeyList to make a list of keys
+		4.5 for each item in the keylist, it adds a request to the params.requests channel
+		5.  Now we are back in 'startclient', where the work gets done.
+		5.5 it loops through items in the params.request channel, and performs the actual work
+		5.75 : results are put into the params.responses channel
+		6.  The params.Run function collects the results, and returns them to the original (main) function.
 
-		here's what we'll try to do.
+
+	*/
+	StartClients(params)
+	/*
+
 		1.  allow choice of write, read (maybe later list, etc)
 		2.  if write only, just skip doing reads
 		3.  if both, then just do writes and then reads
@@ -180,6 +156,13 @@ func main() {
 	*/
 
 	if strings.Contains(params.operations, "write") {
+		if *multipart {
+			bufferBytes = makeData(*partSize)
+
+		} else {
+			bufferBytes = makeData(*objectSize)
+
+		}
 
 		fmt.Printf("Running %s test...\n", opWrite)
 		writeResult := params.Run(opWrite)
@@ -197,6 +180,13 @@ func main() {
 		fmt.Println()
 
 	} else if strings.Contains(params.operations, "both") {
+		if *multipart {
+			bufferBytes = makeData(*partSize)
+
+		} else {
+			bufferBytes = makeData(*objectSize)
+
+		}
 		fmt.Printf("Running %s test...\n", opWrite)
 		writeResult := params.Run(opWrite)
 
@@ -209,41 +199,102 @@ func main() {
 
 	}
 
-	// Do cleanup if required
 	if !*skipCleanup {
-		fmt.Println()
-		fmt.Printf("Cleaning up %d objects...\n", *numSamples)
-		delStartTime := time.Now()
-		svc := s3.New(session.New(), cfg)
+		params.cleanup(svc)
 
-		numSuccessfullyDeleted := 0
-
-		keyList := make([]*s3.ObjectIdentifier, 0, commitSize)
-		for i := 0; i < *numSamples; i++ {
-			bar := s3.ObjectIdentifier{
-				Key: aws.String(fmt.Sprintf("%s%d", *objectNamePrefix, i)),
-			}
-			keyList = append(keyList, &bar)
-			if len(keyList) == commitSize || i == *numSamples-1 {
-				fmt.Printf("Deleting a batch of %d objects in range {%d, %d}... ", len(keyList), i-len(keyList)+1, i)
-				params := &s3.DeleteObjectsInput{
-					Bucket: aws.String(*bucketName),
-					Delete: &s3.Delete{
-						Objects: keyList}}
-				_, err := svc.DeleteObjects(params)
-				if err == nil {
-					numSuccessfullyDeleted += len(keyList)
-					fmt.Printf("Succeeded\n")
-				} else {
-					fmt.Printf("Failed (%v)\n", err)
-				}
-				//set cursor to 0 so we can move to the next batch.
-				keyList = keyList[:0]
-
-			}
-		}
-		fmt.Printf("Successfully deleted %d/%d objects in %s\n", numSuccessfullyDeleted, *numSamples, time.Since(delStartTime))
 	}
+
+}
+
+//first, make a func which will create the session setup.
+
+func makeS3session(params Params, endpoint string) *s3.S3 {
+	var httpClient = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	cfg := &aws.Config{
+		Credentials:                   credentials.NewStaticCredentials(params.accessKey, params.accessSecret, ""),
+		Region:                        aws.String(params.region),
+		S3ForcePathStyle:              aws.Bool(true),
+		S3DisableContentMD5Validation: aws.Bool(params.disableMD5),
+		Endpoint:                      aws.String(endpoint),
+		HTTPClient:                    httpClient,
+	}
+	sess := session.New(cfg)
+
+	s3client := s3.New(sess)
+	return s3client
+
+}
+
+// next, a function to create a bucket
+
+func makeBucket(bucketName *string, svc *s3.S3) {
+	cparams := &s3.CreateBucketInput{
+		Bucket: bucketName, // Required
+	}
+	if _, derr := svc.CreateBucket(cparams); derr != nil && !isBucketAlreadyOwnedByYouErr(derr) {
+		log.Fatal(derr)
+	}
+
+}
+
+// function to generate data
+
+func makeData(dataSize int64) []byte {
+	fmt.Printf("Generating %v bytes in-memory sample data... ", dataSize)
+	timeGenData := time.Now()
+
+	bufferBytes = make([]byte, dataSize, dataSize)
+	_, err := rand.Read(bufferBytes)
+	if err != nil {
+		fmt.Printf("Could not allocate a buffer")
+		os.Exit(1)
+	}
+	fmt.Printf("Done (%s)\n", time.Since(timeGenData))
+	fmt.Println()
+	return bufferBytes
+
+}
+
+func (params *Params) cleanup(svc *s3.S3) {
+	fmt.Println()
+	fmt.Printf("Cleaning up %d objects...\n", params.numSamples)
+	delStartTime := time.Now()
+
+	numSuccessfullyDeleted := 0
+	bigList := params.makeKeyList()
+
+	keyList := make([]*s3.ObjectIdentifier, 0, params.batchSize)
+	for i, key := range bigList {
+
+		bar := s3.ObjectIdentifier{
+			Key: key,
+		}
+
+		keyList = append(keyList, &bar)
+		if len(keyList) == params.batchSize || i == params.numSamples-1 {
+			fmt.Printf("Deleting a batch of %d objects in range {%d, %d}... ", len(keyList), i-len(keyList)+1, i)
+			params := &s3.DeleteObjectsInput{
+				Bucket: aws.String(params.bucketName),
+				Delete: &s3.Delete{
+					Objects: keyList}}
+			_, err := svc.DeleteObjects(params)
+			if err == nil {
+				numSuccessfullyDeleted += len(keyList)
+				fmt.Printf("Succeeded\n")
+			} else {
+				fmt.Printf("Failed (%v)\n", err)
+			}
+			//set cursor to 0 so we can move to the next batch.
+			keyList = keyList[:0]
+
+		}
+		i++
+	}
+	fmt.Printf("Successfully deleted %d/%d objects in %s\n", numSuccessfullyDeleted, params.numSamples, time.Since(delStartTime))
 }
 
 func isBucketAlreadyOwnedByYouErr(err error) bool {
@@ -266,6 +317,7 @@ func (params *Params) Run(op string) Result {
 		errorString := ""
 		if resp.err != nil {
 			result.numErrors++
+			fmt.Printf("error: %s", resp.err)
 			errorString = fmt.Sprintf(", error: %s", resp.err)
 		} else {
 			result.bytesTransmitted = result.bytesTransmitted + params.objectSize
@@ -284,10 +336,7 @@ func (params *Params) Run(op string) Result {
 	return result
 }
 
-// Create an individual load request and submit it to the client queue
-func (params *Params) submitLoad(op string) {
-	bucket := aws.String(params.bucketName)
-
+func (params *Params) makeKeyList() []*string {
 	/*
 		goal here is to divide up all the requests so that there are no more than $batchSize per prefix-$num/ .
 		EG: if the prefix is 'andy' , then we want to make $(numsamples / $batchSize) sub-prefixes , so that the result is:
@@ -318,20 +367,28 @@ func (params *Params) submitLoad(op string) {
 
 		}
 	}
+	return bigList
+}
+
+// Create an individual load request and submit it to the client queue
+func (params *Params) submitLoad(op string) {
+	bucket := aws.String(params.bucketName)
+	bigList := params.makeKeyList()
 
 	// now actually submit the load.
+	// if we want to do manual multipart, perhaps we need a separate channel.
 
 	for f := 0; f < len(bigList); f++ {
 		if op == opWrite {
 
 			if params.multipart {
-				params.requests <- &s3manager.UploadInput{
+				// once per object, there will be a separate setup for individual mpu's.
+				params.requests <- &s3.CreateMultipartUploadInput{
 					Bucket: bucket,
 					Key:    bigList[f],
-					Body:   bytes.NewReader(bufferBytes),
 				}
-
 			} else {
+				//not multipart
 				params.requests <- &s3.PutObjectInput{
 					Bucket: bucket,
 					Key:    bigList[f],
@@ -339,6 +396,7 @@ func (params *Params) submitLoad(op string) {
 				}
 			}
 		} else if op == opRead {
+			//note: we should also do a switch if we're using multipart, since it will be faster and more apples:apples. TBD.
 			params.requests <- &s3.GetObjectInput{
 				Bucket: bucket,
 				Key:    bigList[f],
@@ -350,109 +408,182 @@ func (params *Params) submitLoad(op string) {
 
 }
 
-func (params *Params) StartClients(cfg *aws.Config) {
+func StartClients(params Params) {
+
 	for i := 0; i < int(params.numClients); i++ {
-		cfg.Endpoint = aws.String(params.endpoints[i%len(params.endpoints)])
-		go params.startClient(cfg)
+		svc := makeS3session(params, params.endpoints[i%len(params.endpoints)])
+
+		go params.startClient(svc)
 		time.Sleep(1 * time.Millisecond)
 	}
+
 }
 
 // Run an individual load request
-func (params *Params) startClient(cfg *aws.Config) {
+func (params *Params) startClient(svc *s3.S3) {
 
-	if params.multipart {
-		sess, err := session.NewSession(cfg)
-		if err != nil {
-			panic("bad session setup?")
-		}
-		for request := range params.requests {
+	for request := range params.requests {
+		putStartTime := time.Now()
+		var err error
+		numBytes := params.objectSize
 
-			putStartTime := time.Now()
-			var err error
-			numBytes := params.objectSize
+		switch r := request.(type) {
+		case *s3.PutObjectInput:
 
-			switch r := request.(type) {
-			case *s3manager.UploadInput:
-				//https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/go/example_code/s3/s3_upload_object.go
-				uploader := s3manager.NewUploader(sess, func(u *s3manager.Uploader) {
-					u.PartSize = params.partSize
-					u.Concurrency = params.multiUploaders
-				})
+			req, _ := svc.PutObjectRequest(r)
+			// below line shouldn't be required to do the flag in the session setup, but keeping it in case.
+			req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
+			err = req.Send()
 
-				_, err := uploader.Upload(r)
-
-				if err != nil {
-					fmt.Printf("error uploading: %v", err)
-				}
-
-			case *s3.GetObjectInput:
-				//https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/go/example_code/s3/s3_download_object.go
-				downloader := s3manager.NewDownloader(sess, func(u *s3manager.Downloader) {
-					u.PartSize = params.partSize
-					u.Concurrency = params.multiUploaders
-				})
-				numBytes = 0
-				file, openErr := os.OpenFile("/dev/null", os.O_WRONLY, 644) //perhaps there's a better way, but this seems to work.
-				if openErr != nil {
-					panic("woops")
-				}
-
-				numBytes, err := downloader.Download(file,
-					r)
-				if err != nil {
-					fmt.Printf("error: %v", err)
-				}
-
-				if numBytes != params.objectSize {
-					err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
-				}
-			default:
-				panic("Developer error")
+		case *s3.GetObjectInput:
+			req, resp := svc.GetObjectRequest(r)
+			err = req.Send()
+			numBytes = 0
+			if err == nil {
+				numBytes, err = io.Copy(ioutil.Discard, resp.Body)
+			} else {
+				fmt.Printf("there was an erra: %v , %v", resp, err)
+			}
+			if numBytes != params.objectSize {
+				err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
 			}
 
-			params.responses <- Resp{err, time.Since(putStartTime), numBytes}
-		}
-	} else {
+		case *s3.CreateMultipartUploadInput:
+			//first, make a MPU, and get the ID.
 
-		svc := s3.New(session.New(), cfg)
-		for request := range params.requests {
-			putStartTime := time.Now()
-			var err error
-			numBytes := params.objectSize
+			mpu, _ := svc.CreateMultipartUpload(r)
+			//we need a place to store completed parts.
 
-			switch r := request.(type) {
-			case *s3.PutObjectInput:
+			ph := new(partholder)
 
-				req, _ := svc.PutObjectRequest(r)
-				// below line shouldn't be required to do the flag in the session setup, but keeping it in case.
-				req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
-				err = req.Send()
+			//this time , we need to randomize the endpoint list, in case the number of multi-uploaders is smaller than the full list.
+			randEndpoints := make([]string, len(params.endpoints))
+			perm := mrand.Perm(len(params.endpoints))
+			for i, v := range perm {
+				randEndpoints[v] = params.endpoints[i]
+			}
+			//make a channel just for this one object. all part-uploads for this object will flow through it.
+			ch := make(chan Req)
+			//also make a waitgroup
+			wg := new(sync.WaitGroup)
+			//and ..make a mutex/locker, so that we can lock before we update the parts list.
+			mlock := new(sync.Mutex)
+			//we need some more clients, specifically, one per '-multiuploader'
+			for i := 0; i < int(params.multiUploaders); i++ {
+				svc := makeS3session(*params, randEndpoints[i%len(randEndpoints)])
 
-			case *s3.GetObjectInput:
-				req, resp := svc.GetObjectRequest(r)
-				err = req.Send()
-				numBytes = 0
-				if err == nil {
-					numBytes, err = io.Copy(ioutil.Discard, resp.Body)
-				}
-				if numBytes != params.objectSize {
-					err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
-				}
-			default:
-				panic("Developer error")
+				//increment wg counter
+				wg.Add(1)
+				// now, pass along the params, svc, and completedParts list.
+				// perhaps its better to make a struct for all this stuff?
+				go startMultipartUploader(*params, svc, mpu, ph, wg, ch, mlock)
+
 			}
 
-			params.responses <- Resp{err, time.Since(putStartTime), numBytes}
+			//now, need to iterate through the partslist, and shove into a channel.
+			var curr, partLength int64
+			var remaining = params.objectSize
+			partNumber := 1
+			for curr = 0; remaining != 0; curr += partLength {
+				if remaining < params.partSize {
+					//this can probably be simplified, but for now leaving this way to ensure that we don't make extra copies of the slice.
+					partLength = remaining
+					byteSlice := make([]byte, partLength)
+					copy(byteSlice, bufferBytes)
+
+					//actually send the request to the channel.
+					ch <- &s3.UploadPartInput{
+						Body:          bytes.NewReader(byteSlice),
+						Bucket:        mpu.Bucket,
+						Key:           mpu.Key,
+						PartNumber:    aws.Int64(int64(partNumber)),
+						UploadId:      mpu.UploadId,
+						ContentLength: aws.Int64(partLength),
+					}
+				} else {
+					partLength = params.partSize
+
+					//actually send the request to the channel.
+					ch <- &s3.UploadPartInput{
+						Body:          bytes.NewReader(bufferBytes),
+						Bucket:        mpu.Bucket,
+						Key:           mpu.Key,
+						PartNumber:    aws.Int64(int64(partNumber)),
+						UploadId:      mpu.UploadId,
+						ContentLength: aws.Int64(partLength),
+					}
+				}
+
+				remaining -= partLength
+				partNumber++
+			}
+			//close the channel
+			close(ch)
+			//now we wait..
+			wg.Wait()
+			//sort the parts list
+			sort.Sort(partSorter(ph.parts))
+
+			//now, assuming all went well, complete the MPU
+			cparams := &s3.CompleteMultipartUploadInput{
+				Bucket:          mpu.Bucket,
+				Key:             mpu.Key,
+				UploadId:        mpu.UploadId,
+				MultipartUpload: &s3.CompletedMultipartUpload{Parts: ph.parts},
+			}
+
+			_, err = svc.CompleteMultipartUpload(cparams)
+			if err != nil {
+				fmt.Printf("errror with mpu complete: %v", err)
+
+			}
+
+		default:
+			panic("Developer error")
 		}
+
+		params.responses <- Resp{err, time.Since(putStartTime), numBytes}
 	}
 }
 
+func startMultipartUploader(params Params, svc *s3.S3, mpu *s3.CreateMultipartUploadOutput, ph *partholder, wg *sync.WaitGroup, ch chan Req, mlock *sync.Mutex) {
+	defer wg.Done()
+	for request := range ch {
+		switch r := request.(type) {
+		case *s3.UploadPartInput:
+			uoutput, err := svc.UploadPart(r)
+
+			if err != nil {
+				fmt.Printf("errror with mpu: %v", err)
+			}
+			part := &s3.CompletedPart{}
+			part.SetPartNumber(*r.PartNumber)
+			part.SetETag(*uoutput.ETag)
+
+			mlock.Lock()
+
+			ph.parts = append(ph.parts, part)
+
+			mlock.Unlock()
+
+		}
+
+	}
+
+}
+
+type partSorter []*s3.CompletedPart
+
+func (a partSorter) Len() int           { return len(a) }
+func (a partSorter) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a partSorter) Less(i, j int) bool { return *a[i].PartNumber < *a[j].PartNumber }
+
 // Specifies the parameters for a given test
 type Params struct {
-	operation        string
-	operations       string
-	requests         chan Req
+	operation  string
+	operations string
+	requests   chan Req
+
 	responses        chan Resp
 	numSamples       int
 	batchSize        int
@@ -463,6 +594,9 @@ type Params struct {
 	multipart        bool
 	objectNamePrefix string
 	bucketName       string
+	accessKey        string
+	accessSecret     string
+	region           string
 	endpoints        []string
 	verbose          bool
 	disableMD5       bool
@@ -477,7 +611,12 @@ func (params Params) String() string {
 	output += fmt.Sprintf("numClients:       %d\n", params.numClients)
 	output += fmt.Sprintf("numSamples:       %d\n", params.numSamples)
 	output += fmt.Sprintf("batchSize:       %d\n", params.batchSize)
-	output += fmt.Sprintf("verbose:       %d\n", params.verbose)
+	if params.multipart {
+		output += fmt.Sprintf("verbose:       %v\n", params.multipart)
+		output += fmt.Sprintf("partSize:       %d\n", float64(params.partSize)/(1024*1024))
+
+	}
+	output += fmt.Sprintf("verbose:       %v\n", params.verbose)
 	return output
 }
 
@@ -524,4 +663,8 @@ type Resp struct {
 	err      error
 	duration time.Duration
 	numBytes int64
+}
+
+type partholder struct {
+	parts []*s3.CompletedPart
 }
