@@ -2,16 +2,21 @@
 
 *TODO:
 0.  add logic to check if objectSize < MPU size (fallback to regular puts.)
+1.  parallelize deletes by putting into multiple channels.
 1.  Make a 'runtime' test: where it will re-run over and over for the specified runtime
 2.  have a 'simplified' output mode to dump only the relevant bits: so when running on many hosts it can be easier to aggregate.
-3.  randomize better: have each 'put' use slightly different data:
-	* maybe: create a buffer that is 2x as big as we need, then just read random offsets from it?
+4.  keep track of rtt for each part (to generate latency distribution per part)
+5.  for really large objects (non-multipart), figure out the right way to make sure data generation doesn't take too long.
+5.  figure out how to deal with (gracefully) 500 errors (eg: exponential backoff/retry)
+
 
 
 */
 package main
 
 import (
+	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"runtime/pprof"
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
@@ -67,6 +72,7 @@ func main() {
 	skipCleanup := flag.Bool("skipCleanup", false, "skip deleting objects created by this tool at the end of the run")
 	verbose := flag.Bool("verbose", false, "print verbose per thread status")
 	disableMD5 := flag.Bool("disableMD5", true, "for v4 auth: disable source md5sum calcs (faster)")
+	cpuprofile := flag.Bool("cpuprofile", false, "profile this mofo")
 
 	flag.Parse()
 
@@ -80,13 +86,27 @@ func main() {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
+	//make sure that the right sizes are used
 
-	if *multipart && *partSize < 5242880 {
-		fmt.Printf("multipart size must be at least 5242880 bytes, you specificied %v", *partSize)
-		flag.PrintDefaults()
-		os.Exit(1)
+
+	if *multipart {
+
+		if *partSize < 5242880 {
+			fmt.Printf("multipart size must be at least 5242880 bytes, you specificied %v", *partSize)
+			flag.PrintDefaults()
+			os.Exit(1)
+
+		}
+		numParts := *objectSize / *partSize
+		if numParts > 10000 {
+			fmt.Printf("Using an -objectSize of %v and a -partSize of %v results in too many parts ( %v ), make one bigger/smaller...", *objectSize, *partSize, numParts)
+			flag.PrintDefaults()
+			os.Exit(1)
+
+		}
 
 	}
+
 	var opTypeExists = false
 	for op := range optypes {
 		if optypes[op] == *operations {
@@ -124,6 +144,19 @@ func main() {
 	fmt.Println(params)
 	fmt.Println()
 
+	if *cpuprofile {
+		f, err := os.Create("cpuprofile.file")
+		if err != nil {
+			log.Fatal("could not create CPU profile: ", err)
+		}
+		defer f.Close()
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatal("could not start CPU profile: ", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
+
+
 	log.Println("creating bucket if required")
 
 	svc := makeS3session(params, params.endpoints[0])
@@ -157,10 +190,12 @@ func main() {
 
 	if strings.Contains(params.operations, "write") {
 		if *multipart {
-			bufferBytes = makeData(*partSize)
+			chunkSize := *partSize * 2
+			bufferBytes = makeData(chunkSize)
 
 		} else {
-			bufferBytes = makeData(*objectSize)
+			chunkSize := *objectSize * 2
+			bufferBytes = makeData(chunkSize)
 
 		}
 
@@ -181,11 +216,11 @@ func main() {
 
 	} else if strings.Contains(params.operations, "both") {
 		if *multipart {
-			bufferBytes = makeData(*partSize)
-
+			chunkSize := *partSize * 2
+			bufferBytes = makeData(chunkSize)
 		} else {
-			bufferBytes = makeData(*objectSize)
-
+			chunkSize := *objectSize * 2
+			bufferBytes = makeData(chunkSize)
 		}
 		fmt.Printf("Running %s test...\n", opWrite)
 		writeResult := params.Run(opWrite)
@@ -244,6 +279,12 @@ func makeBucket(bucketName *string, svc *s3.S3) {
 // function to generate data
 
 func makeData(dataSize int64) []byte {
+
+	/*
+	This just makes XX bytes of random data.  Its kind of slow, so we just run this at the beginning of the job and re-use this buffer over and over.  The side effect is that this dedupe's a lot.
+	Look at the 'betterSlicer' function to see how we deal with this.
+	*/
+
 	fmt.Printf("Generating %v bytes in-memory sample data... ", dataSize)
 	timeGenData := time.Now()
 
@@ -256,6 +297,37 @@ func makeData(dataSize int64) []byte {
 	fmt.Printf("Done (%s)\n", time.Since(timeGenData))
 	fmt.Println()
 	return bufferBytes
+
+}
+
+
+func betterSlicer(chunkSize int64) []byte {
+
+	/*basically, just return a slice of the bufferbytes slice from a random offset. The idea is this:
+	* the bufferBytes slice is twice the size of the chunk being requested
+	* if we choose a random starting offset within bufferBytes for each chunk, we effecitvely 'randomize' the chunk, since it will
+	shift the bytes.  In theory, since the bufferBytes source data is 100% random, we should be OK, although a similarity based compression
+	algorithm might defeat it (have to test)
+
+	I had tried to come up with something 'smarter', whereby I set a chunksize of 16KB, and used random offsets for each 16KB chunk to assemble an object, however that
+	seemed to increase runtime, as there is a small cost for each random access into the slice.  Its negligible for a small number of iterations, but it adds up.
+
+	Some drawbacks:
+	* small objects (eg: 1k) mean that we will not have enough random-ness.  Probably should make a minimum bufferBytes size to deal with this.
+	* large objects (eg: 10G) which are not multipart mean that we have to generate a large buffer (eg: 20G). Perhaps that's OK.
+
+
+	 */
+	randStop := int64(len(bufferBytes)) - chunkSize
+	mrand.Seed(time.Now().UnixNano())
+
+	randStart := mrand.Int63n(randStop - 1)
+	randEnd := randStart + chunkSize
+
+
+	chunky := bufferBytes[randStart:randEnd]
+
+	return chunky
 
 }
 
@@ -339,7 +411,7 @@ func (params *Params) Run(op string) Result {
 func (params *Params) makeKeyList() []*string {
 	/*
 		goal here is to divide up all the requests so that there are no more than $batchSize per prefix-$num/ .
-		EG: if the prefix is 'andy' , then we want to make $(numsamples / $batchSize) sub-prefixes , so that the result is:
+		EG: if the prefix is 'andy' , then we want to make $(numsamples /  ) sub-prefixes , so that the result is:
 		bucket/andy/1/
 		bucket/andy/2/
 		etc
@@ -372,31 +444,41 @@ func (params *Params) makeKeyList() []*string {
 
 // Create an individual load request and submit it to the client queue
 func (params *Params) submitLoad(op string) {
+
+	/*if we want to do some kind of bucket distribution, this is one place to do it. Another place
+	might be in the makeKeyList function.
+Maybe do like this?
+
+	1. count the buckets, and divide up the total number of keys to put (last bucket will get less)
+	2. iterate through the keys, similarly to the makeKeyList function, assining each key to a bucket
+	3.  submit
+
+	*/
 	bucket := aws.String(params.bucketName)
 	bigList := params.makeKeyList()
 
 	// now actually submit the load.
-	// if we want to do manual multipart, perhaps we need a separate channel.
 
 	for f := 0; f < len(bigList); f++ {
 		if op == opWrite {
 
 			if params.multipart {
-				// once per object, there will be a separate setup for individual mpu's.
+				// once per object, there will be a separate setup for individual parts.
 				params.requests <- &s3.CreateMultipartUploadInput{
 					Bucket: bucket,
 					Key:    bigList[f],
 				}
 			} else {
 				//not multipart
+
 				params.requests <- &s3.PutObjectInput{
 					Bucket: bucket,
 					Key:    bigList[f],
-					Body:   bytes.NewReader(bufferBytes),
+					Body:   bytes.NewReader(betterSlicer(params.objectSize)),
 				}
 			}
 		} else if op == opRead {
-			//note: we should also do a switch if we're using multipart, since it will be faster and more apples:apples. TBD.
+
 			params.requests <- &s3.GetObjectInput{
 				Bucket: bucket,
 				Key:    bigList[f],
@@ -431,29 +513,50 @@ func (params *Params) startClient(svc *s3.S3) {
 		case *s3.PutObjectInput:
 
 			req, _ := svc.PutObjectRequest(r)
-			// below line shouldn't be required to do the flag in the session setup, but keeping it in case.
 			req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD")
 			err = req.Send()
 
 		case *s3.GetObjectInput:
-			req, resp := svc.GetObjectRequest(r)
-			err = req.Send()
-			numBytes = 0
-			if err == nil {
-				numBytes, err = io.Copy(ioutil.Discard, resp.Body)
-			} else {
-				fmt.Printf("there was an erra: %v , %v", resp, err)
-			}
-			if numBytes != params.objectSize {
-				err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
+			if params.multipart {
+				//https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/go/example_code/s3/s3_download_object.go
+				downloader := s3manager.NewDownloaderWithClient(svc, func(u *s3manager.Downloader) {
+					u.PartSize = params.partSize
+					u.Concurrency = params.multiUploaders
+				})
+				numBytes = 0
+				file, openErr := os.OpenFile("/dev/null", os.O_WRONLY, 644) //perhaps there's a better way, but this seems to work.
+				if openErr != nil {
+					panic("woops")
+				}
+
+				numBytes, err := downloader.Download(file, r)
+				if err != nil {
+					fmt.Printf("error: %v", err)
+				}
+
+				if numBytes != params.objectSize {
+					err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
+				}
+			} else { //not multipart.
+				req, resp := svc.GetObjectRequest(r)
+				err = req.Send()
+				numBytes = 0
+				if err == nil {
+					numBytes, err = io.Copy(ioutil.Discard, resp.Body)
+				} else {
+					fmt.Printf("there was a read error: %v , %v", resp, err)
+				}
+				if numBytes != params.objectSize {
+					err = fmt.Errorf("expected object length %d, actual %d", params.objectSize, numBytes)
+				}
 			}
 
 		case *s3.CreateMultipartUploadInput:
 			//first, make a MPU, and get the ID.
 
 			mpu, _ := svc.CreateMultipartUpload(r)
-			//we need a place to store completed parts.
 
+			//we need a place to store info about completed parts
 			ph := new(partholder)
 
 			//this time , we need to randomize the endpoint list, in case the number of multi-uploaders is smaller than the full list.
@@ -474,22 +577,23 @@ func (params *Params) startClient(svc *s3.S3) {
 
 				//increment wg counter
 				wg.Add(1)
-				// now, pass along the params, svc, and completedParts list.
-				// perhaps its better to make a struct for all this stuff?
+				// now, pass along the params, svc, mpu id, and completedParts list, and the wg/channel/and sync so that the sub-client has it.
 				go startMultipartUploader(*params, svc, mpu, ph, wg, ch, mlock)
 
 			}
 
-			//now, need to iterate through the partslist, and shove into a channel.
+			//now, need to iterate through the partslist, and shove into the channel.
 			var curr, partLength int64
 			var remaining = params.objectSize
 			partNumber := 1
 			for curr = 0; remaining != 0; curr += partLength {
-				if remaining < params.partSize {
+				if remaining < params.partSize { //this is for sending the 'last part' , which will be smaller.
 					//this can probably be simplified, but for now leaving this way to ensure that we don't make extra copies of the slice.
 					partLength = remaining
-					byteSlice := make([]byte, partLength)
-					copy(byteSlice, bufferBytes)
+					byteSlice := make([]byte, partLength) //new slice which is the size of the last part
+					copy(byteSlice, bufferBytes)          //copy bytes from our 'normal' slice into this one. it might be better to
+															// use the betterSlicer for this now (faster?) but its only one part per object, and
+															// its the smaller one..so whatever.
 
 					//actually send the request to the channel.
 					ch <- &s3.UploadPartInput{
@@ -500,12 +604,12 @@ func (params *Params) startClient(svc *s3.S3) {
 						UploadId:      mpu.UploadId,
 						ContentLength: aws.Int64(partLength),
 					}
-				} else {
+				} else { //this is the 'normal' case, where we use the user defined partSize
 					partLength = params.partSize
 
 					//actually send the request to the channel.
 					ch <- &s3.UploadPartInput{
-						Body:          bytes.NewReader(bufferBytes),
+						Body:          bytes.NewReader(betterSlicer(params.partSize)),
 						Bucket:        mpu.Bucket,
 						Key:           mpu.Key,
 						PartNumber:    aws.Int64(int64(partNumber)),
@@ -517,11 +621,11 @@ func (params *Params) startClient(svc *s3.S3) {
 				remaining -= partLength
 				partNumber++
 			}
-			//close the channel
-			close(ch)
-			//now we wait..
-			wg.Wait()
-			//sort the parts list
+			close(ch) 			//close the channel
+
+			wg.Wait()		//now we wait..
+
+			//sort the parts list once we have all of them. s3 cares that the list is ordered.
 			sort.Sort(partSorter(ph.parts))
 
 			//now, assuming all went well, complete the MPU
@@ -550,17 +654,19 @@ func startMultipartUploader(params Params, svc *s3.S3, mpu *s3.CreateMultipartUp
 	defer wg.Done()
 	for request := range ch {
 		switch r := request.(type) {
-		case *s3.UploadPartInput:
-			uoutput, err := svc.UploadPart(r)
+		case *s3.UploadPartInput: //in the future, maybe we can also have a case for ranged-read (eg; the GET equivalent)
+			req, uoutput := svc.UploadPartRequest(r)
+			req.HTTPRequest.Header.Add("X-Amz-Content-Sha256", "UNSIGNED-PAYLOAD") //this makes a HUGE difference in CPU.
+			err := req.Send()
 
 			if err != nil {
 				fmt.Printf("errror with mpu: %v", err)
 			}
-			part := &s3.CompletedPart{}
+			part := &s3.CompletedPart{} // setup a place this part info , then populate with needed data.
 			part.SetPartNumber(*r.PartNumber)
 			part.SetETag(*uoutput.ETag)
 
-			mlock.Lock()
+			mlock.Lock() // before we append this part info into the list, lock.
 
 			ph.parts = append(ph.parts, part)
 
@@ -572,11 +678,19 @@ func startMultipartUploader(params Params, svc *s3.S3, mpu *s3.CreateMultipartUp
 
 }
 
+// this is to make sure we have a way to properly sort the parts list.
 type partSorter []*s3.CompletedPart
 
 func (a partSorter) Len() int           { return len(a) }
 func (a partSorter) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a partSorter) Less(i, j int) bool { return *a[i].PartNumber < *a[j].PartNumber }
+
+
+
+type partholder struct {
+	parts []*s3.CompletedPart
+}
+
 
 // Specifies the parameters for a given test
 type Params struct {
@@ -603,19 +717,36 @@ type Params struct {
 }
 
 func (params Params) String() string {
+
 	output := fmt.Sprintln("Test parameters")
 	output += fmt.Sprintf("endpoint(s):      %s\n", params.endpoints)
 	output += fmt.Sprintf("bucket:           %s\n", params.bucketName)
 	output += fmt.Sprintf("objectNamePrefix: %s\n", params.objectNamePrefix)
-	output += fmt.Sprintf("objectSize:       %0.4f MB\n", float64(params.objectSize)/(1024*1024))
+	// there's probably a better way to scale this, but for now just do something easy
+	if float64(params.objectSize)/(1024*1024) > 1024 {
+		if float64(params.objectSize)/(1024*1024*1024) > 1024 {
+			output += fmt.Sprintf("objectSize:       %0.4f TB\n", float64(params.objectSize)/(1024*1024*1024*1024))
+
+		} else { //means its GB
+			output += fmt.Sprintf("objectSize:       %0.4f GB\n", float64(params.objectSize)/(1024*1024*1024))
+
+		}
+	} else { //means its MB
+		output += fmt.Sprintf("objectSize:       %0.4f GB\n", float64(params.objectSize)/(1024*1024))
+
+	}
+
 	output += fmt.Sprintf("numClients:       %d\n", params.numClients)
 	output += fmt.Sprintf("numSamples:       %d\n", params.numSamples)
 	output += fmt.Sprintf("batchSize:       %d\n", params.batchSize)
 	if params.multipart {
-		output += fmt.Sprintf("verbose:       %v\n", params.multipart)
-		output += fmt.Sprintf("partSize:       %d\n", float64(params.partSize)/(1024*1024))
-
+		output += fmt.Sprintf("multipart enabled:       %v\n", params.multipart)
+		output += fmt.Sprintf("partSize:       %v MB\n", float64(params.partSize)/(1024*1024))
 	}
+	//calculate the total size of the test
+	totalSize := int64(params.numSamples) * params.objectSize
+	output += fmt.Sprintf("Total size of test : %0.4f GB\n", float64(totalSize)/(1024*1024*1024))
+
 	output += fmt.Sprintf("verbose:       %v\n", params.verbose)
 	return output
 }
@@ -663,8 +794,4 @@ type Resp struct {
 	err      error
 	duration time.Duration
 	numBytes int64
-}
-
-type partholder struct {
-	parts []*s3.CompletedPart
 }
