@@ -44,9 +44,11 @@ import (
 const (
 	opRead  = "Read"
 	opWrite = "Write"
+	minChunkSize = 20 * 1024 * 1024
 )
 
 var bufferBytes []byte
+
 
 func main() {
 
@@ -73,6 +75,12 @@ func main() {
 	verbose := flag.Bool("verbose", false, "print verbose per thread status")
 	disableMD5 := flag.Bool("disableMD5", true, "for v4 auth: disable source md5sum calcs (faster)")
 	cpuprofile := flag.Bool("cpuprofile", false, "profile this mofo")
+	moreRando := flag.Bool("moreRando", false, "moreRando")
+	chunkSize := flag.Int64("chunkSize", 31*1024, "When using -moreRando : chunk size to defeat dedup.")
+
+
+
+
 
 	flag.Parse()
 
@@ -138,6 +146,9 @@ func main() {
 		partSize:         *partSize,
 		multiUploaders:   *multiUploaders,
 		disableMD5:       *disableMD5,
+		moreRando:       *moreRando,
+		chunkSize:		 *chunkSize,
+
 
 		verbose: *verbose,
 	}
@@ -155,6 +166,8 @@ func main() {
 		}
 		defer pprof.StopCPUProfile()
 	}
+
+	mrand.Seed(time.Now().UnixNano())
 
 
 	log.Println("creating bucket if required")
@@ -190,12 +203,23 @@ func main() {
 
 	if strings.Contains(params.operations, "write") {
 		if *multipart {
-			chunkSize := *partSize * 2
-			bufferBytes = makeData(chunkSize)
+			//need to make a minimum amount of random data, or the slicer won't be very effective.
+			if *partSize < minChunkSize/2 {
+				chunkSize := minChunkSize
+				bufferBytes = makeData(int64(chunkSize))
+			} else {
+				chunkSize := *partSize * 2
+				bufferBytes = makeData(chunkSize)
+			}
 
-		} else {
-			chunkSize := *objectSize * 2
-			bufferBytes = makeData(chunkSize)
+		} else { //not multipart
+			if *objectSize < minChunkSize/2 {
+				chunkSize := minChunkSize
+				bufferBytes = makeData(int64(chunkSize))
+			} else {
+				chunkSize := *objectSize * 2
+				bufferBytes = makeData(chunkSize)
+			}
 
 		}
 
@@ -311,15 +335,23 @@ func betterSlicer(chunkSize int64) []byte {
 
 	I had tried to come up with something 'smarter', whereby I set a chunksize of 16KB, and used random offsets for each 16KB chunk to assemble an object, however that
 	seemed to increase runtime, as there is a small cost for each random access into the slice.  Its negligible for a small number of iterations, but it adds up.
+	Since it appears that the code below does not defeat VAST similarity, maybe there is some tradeoff to make here.  perhaps adjust the chunk size to 1M.  However: how
+	to do that without copying slices?  Is there a way to:
+	1.  create a function that will return a single slice
+	2.  that function would calculate XX rnadom 'starting points' within the bufferBytes slice
+	3.  iterate through each starting point to yield a different start/end
+	4.  do all this without copying any bytes.  Note that this would probably help eliminate dedup completely as well.
 
 	Some drawbacks:
-	* small objects (eg: 1k) mean that we will not have enough random-ness.  Probably should make a minimum bufferBytes size to deal with this.
 	* large objects (eg: 10G) which are not multipart mean that we have to generate a large buffer (eg: 20G). Perhaps that's OK.
+	* Note: this does NOT defeat VAST similarity compression.  It only defeats regular compression & dedup.
 
 
-	 */
+
+	*/
+
+
 	randStop := int64(len(bufferBytes)) - chunkSize
-	mrand.Seed(time.Now().UnixNano())
 
 	randStart := mrand.Int63n(randStop - 1)
 	randEnd := randStart + chunkSize
@@ -330,6 +362,68 @@ func betterSlicer(chunkSize int64) []byte {
 	return chunky
 
 }
+
+
+
+
+func sliceBuilder(dataSize  int64, moreRando bool, chunkSize int64) []byte {
+
+	/*
+
+
+
+	try to defeat dedup:
+	1.  use a 31k block size.
+	2.  randomize each segment via betterslicer
+	3.  build a slice per object, use append (slow..)
+
+	seems like it does defeat dedup, but the cost is high (cuts write perf in half or more)
+	also, it doesn't defeat sim , if the bs=31k. It does mostly defeat sim if you bring the block size down to 1k (but then you get some dedup since it divides into 32k evenly..perhaps 3k is beter..)
+
+	turns out the assignment might be faster than append, : https://stackoverflow.com/questions/38654729/golang-slice-append-vs-assign-performance
+
+
+	*/
+	//make a slice
+
+	byteStorage := make([]byte, chunkSize, dataSize)
+
+	if moreRando {
+
+
+
+
+		//set initial cursor to zero?
+		byteStorage = byteStorage[:0]
+
+		var curr, partLength int64
+		var remaining = dataSize
+		partNumber := 1
+		for curr = 0; remaining != 0; curr += partLength {
+			if remaining < chunkSize { //for the last chunk, which may be smaller.
+				partLength = remaining
+				//byteStorage[curr] = betterSlicer(partLength)
+				byteStorage = append(byteStorage, betterSlicer(partLength)...)
+			} else { // normal path
+				partLength = chunkSize
+				byteStorage = append(byteStorage, betterSlicer(partLength)...)// this appears to be slow, cuts b/w in half.
+
+			}
+			remaining -= partLength
+			partNumber++
+		}
+
+
+	} else {
+		byteStorage = betterSlicer(dataSize)
+	}
+
+	return byteStorage
+
+
+
+}
+
 
 func (params *Params) cleanup(svc *s3.S3) {
 	fmt.Println()
@@ -474,7 +568,8 @@ Maybe do like this?
 				params.requests <- &s3.PutObjectInput{
 					Bucket: bucket,
 					Key:    bigList[f],
-					Body:   bytes.NewReader(betterSlicer(params.objectSize)),
+					Body:   bytes.NewReader(sliceBuilder(params.objectSize, params.moreRando, params.chunkSize)),
+					//Body:   bytes.NewReader(betterSlicer(params.objectSize)),
 				}
 			}
 		} else if op == opRead {
@@ -518,7 +613,7 @@ func (params *Params) startClient(svc *s3.S3) {
 
 		case *s3.GetObjectInput:
 			if params.multipart {
-				//https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/go/example_code/s3/s3_download_object.go
+				// https://github.com/awsdocs/aws-doc-sdk-examples/blob/master/go/example_code/s3/s3_download_object.go
 				downloader := s3manager.NewDownloaderWithClient(svc, func(u *s3manager.Downloader) {
 					u.PartSize = params.partSize
 					u.Concurrency = params.multiUploaders
@@ -590,14 +685,15 @@ func (params *Params) startClient(svc *s3.S3) {
 				if remaining < params.partSize { //this is for sending the 'last part' , which will be smaller.
 					//this can probably be simplified, but for now leaving this way to ensure that we don't make extra copies of the slice.
 					partLength = remaining
-					byteSlice := make([]byte, partLength) //new slice which is the size of the last part
-					copy(byteSlice, bufferBytes)          //copy bytes from our 'normal' slice into this one. it might be better to
+					//byteSlice := make([]byte, partLength) //new slice which is the size of the last part
+					//copy(byteSlice, bufferBytes)          //copy bytes from our 'normal' slice into this one. it might be better to
 															// use the betterSlicer for this now (faster?) but its only one part per object, and
 															// its the smaller one..so whatever.
 
 					//actually send the request to the channel.
 					ch <- &s3.UploadPartInput{
-						Body:          bytes.NewReader(byteSlice),
+						Body:          bytes.NewReader(sliceBuilder(partLength, params.moreRando, params.chunkSize)),
+						//Body:          bytes.NewReader(betterSlicer(partLength)),
 						Bucket:        mpu.Bucket,
 						Key:           mpu.Key,
 						PartNumber:    aws.Int64(int64(partNumber)),
@@ -609,7 +705,8 @@ func (params *Params) startClient(svc *s3.S3) {
 
 					//actually send the request to the channel.
 					ch <- &s3.UploadPartInput{
-						Body:          bytes.NewReader(betterSlicer(params.partSize)),
+						Body:   bytes.NewReader(sliceBuilder(params.partSize, params.moreRando, params.chunkSize)),
+						//Body:          bytes.NewReader(betterSlicer(params.partSize)),
 						Bucket:        mpu.Bucket,
 						Key:           mpu.Key,
 						PartNumber:    aws.Int64(int64(partNumber)),
@@ -714,6 +811,10 @@ type Params struct {
 	endpoints        []string
 	verbose          bool
 	disableMD5       bool
+	moreRando       bool
+	chunkSize       int64
+
+
 }
 
 func (params Params) String() string {
@@ -732,7 +833,7 @@ func (params Params) String() string {
 
 		}
 	} else { //means its MB
-		output += fmt.Sprintf("objectSize:       %0.4f GB\n", float64(params.objectSize)/(1024*1024))
+		output += fmt.Sprintf("objectSize:       %0.4f MB\n", float64(params.objectSize)/(1024*1024))
 
 	}
 
