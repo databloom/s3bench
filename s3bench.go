@@ -513,6 +513,7 @@ func (params *Params) makeKeyList() []*string {
 	*/
 	keyList := make([]*string, 0, params.batchSize)
 	bigList := make([]*string, 0, params.numSamples)
+
 	numDirs := 0
 	for i := 0; i < params.numSamples; i++ {
 		bar := string(i)
@@ -533,7 +534,9 @@ func (params *Params) makeKeyList() []*string {
 
 		}
 	}
-	return bigList
+	rand.Seed(time.Now().UnixNano()))
+
+	return rand.Shuffle(bigList)
 }
 
 // Create an individual load request and submit it to the client queue
@@ -549,7 +552,11 @@ Maybe do like this?
 
 	*/
 	bucket := aws.String(params.bucketName)
+	
 	bigList := params.makeKeyList()
+
+	fmt.Printf("What does biglist look like", (%v)\n", bigList)
+
 
 	// now actually submit the load.
 

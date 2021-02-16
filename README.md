@@ -11,7 +11,7 @@ uses the AWS Go SDK.
 Run the following command to build the binary.
 
 ```
-go get github.com/andypern/s3bench
+go get github.com/databloom/s3bench
 ```
 The binary will be placed under $GOPATH/bin/s3bench.
 
